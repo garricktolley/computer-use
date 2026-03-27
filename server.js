@@ -186,7 +186,296 @@ Skip auth tokens / cookies from parameters unless they are clearly user-provided
   return JSON.parse(cleaned);
 }
 
-// ── Browser Actions ──────────────────────────────────────────────────────────
+// ── Smart Mode ───────────────────────────────────────────────────────────────
+
+const SMART_TOOL = {
+  name: 'browser_action',
+  description: 'Perform a browser action. Use this tool to interact with the web page.',
+  input_schema: {
+    type: 'object',
+    required: ['thought', 'action'],
+    properties: {
+      thought: {
+        type: 'string',
+        description: 'Your reasoning about what to do next based on the accessibility snapshot and the task.',
+      },
+      action: {
+        type: 'string',
+        enum: ['click', 'fill', 'navigate', 'script', 'scroll', 'select', 'press_key', 'wait', 'done'],
+        description: 'The action to perform.',
+      },
+      selector: {
+        type: 'string',
+        description: 'Playwright selector for the target element. Use role selectors like role=button[name="Submit"], text selectors like text="Click me", or CSS selectors like #id, .class. Required for click, fill, select.',
+      },
+      value: {
+        type: 'string',
+        description: 'Text to type (fill), URL (navigate), JS code (script), scroll direction "up"/"down" (scroll), key combo like "Enter" (press_key), or option value (select).',
+      },
+    },
+  },
+};
+
+async function getAccessibilitySnapshot(page) {
+  try {
+    const snapshot = await page.locator('body').ariaSnapshot({ timeout: 5000 });
+    if (snapshot.length > 30000) {
+      return snapshot.slice(0, 30000) + '\n... [truncated]';
+    }
+    return snapshot;
+  } catch {
+    return '[Failed to get accessibility snapshot]';
+  }
+}
+
+function formatSmartAction(input) {
+  switch (input.action) {
+    case 'click': return `Click: ${input.selector}`;
+    case 'fill': return `Fill "${input.selector}" with "${input.value}"`;
+    case 'navigate': return `Navigate to ${input.value}`;
+    case 'script': return `Run script: ${input.value?.slice(0, 80)}${(input.value?.length || 0) > 80 ? '...' : ''}`;
+    case 'scroll': return `Scroll ${input.value || 'down'}`;
+    case 'select': return `Select "${input.value}" in ${input.selector}`;
+    case 'press_key': return `Press key: ${input.value}`;
+    case 'wait': return 'Waiting...';
+    case 'done': return 'Task complete';
+    default: return input.action;
+  }
+}
+
+async function executeSmartAction(page, input) {
+  switch (input.action) {
+    case 'click':
+      await page.locator(input.selector).click({ timeout: 5000 });
+      break;
+    case 'fill':
+      await page.locator(input.selector).fill(input.value, { timeout: 5000 });
+      break;
+    case 'navigate':
+      await page.goto(input.value);
+      await page.waitForLoadState('domcontentloaded');
+      break;
+    case 'script':
+      await page.evaluate(input.value);
+      break;
+    case 'scroll': {
+      const delta = (input.value || 'down').toLowerCase() === 'up' ? -500 : 500;
+      await page.mouse.wheel(0, delta);
+      break;
+    }
+    case 'select':
+      await page.locator(input.selector).selectOption(input.value, { timeout: 5000 });
+      break;
+    case 'press_key':
+      await page.keyboard.press(input.value);
+      break;
+    case 'wait':
+      await new Promise(r => setTimeout(r, 1500));
+      break;
+    case 'done':
+      break;
+  }
+}
+
+async function runSmartAgent(task, ws, signal, captureNetwork, startUrl) {
+  let browser = null;
+
+  try {
+    send(ws, { type: 'status', text: 'Launching browser (Smart Mode)...' });
+
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      viewport: { width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    });
+    const page = await context.newPage();
+
+    let networkCapture = null;
+    if (captureNetwork) {
+      networkCapture = setupNetworkCapture(page);
+      send(ws, { type: 'status', text: 'Network capture enabled' });
+    }
+
+    const navUrl = startUrl || 'https://www.google.com';
+    send(ws, { type: 'status', text: `Navigating to ${navUrl}...` });
+    await page.goto(navUrl);
+    await page.waitForLoadState('domcontentloaded');
+
+    const initialScreenshot = await takeScreenshot(page);
+    send(ws, { type: 'screenshot', data: initialScreenshot });
+
+    const initialSnapshot = await getAccessibilitySnapshot(page);
+    send(ws, { type: 'status', text: 'Agent is thinking...' });
+
+    const siteContext = startUrl
+      ? `The browser is open to ${navUrl}.`
+      : 'The browser is open to Google.';
+
+    const systemPrompt = `You are a browser automation agent. You interact with web pages using structured accessibility data — not screenshots. ${siteContext}
+
+You will receive a YAML-like accessibility snapshot of the current page. Use the browser_action tool to interact with the page.
+
+For selectors, use Playwright-compatible selectors derived from the snapshot:
+- Role selectors: role=button[name="Submit"], role=link[name="About"], role=textbox[name="Search"]
+- Text selectors: text="Some visible text"
+- CSS selectors: #id, .class, input[type="email"]
+- Combine: role=textbox[name="Search"] >> nth=0
+
+When you see an element like: heading "Example" [level=1], you can target it with role=heading[name="Example"].
+When you see: textbox "Search", you can target it with role=textbox[name="Search"].
+When you see: link "Click here", you can target it with role=link[name="Click here"].
+
+Call browser_action with action "done" when the task is complete.`;
+
+    const messages = [
+      {
+        role: 'user',
+        content: `Task: ${task}\n\nCurrent page accessibility snapshot:\n\`\`\`\n${initialSnapshot}\n\`\`\``,
+      },
+    ];
+
+    let step = 0;
+    const MAX_STEPS = 50;
+
+    while (step < MAX_STEPS) {
+      if (signal.aborted) {
+        send(ws, { type: 'done', message: 'Agent stopped by user.' });
+        break;
+      }
+
+      step++;
+      send(ws, { type: 'step', step, maxSteps: MAX_STEPS });
+
+      const response = await client.messages.create(
+        {
+          model: 'claude-sonnet-4-6',
+          max_tokens: 4096,
+          system: systemPrompt,
+          tools: [SMART_TOOL],
+          messages,
+        },
+        { signal },
+      );
+
+      messages.push({ role: 'assistant', content: response.content });
+
+      let hasToolUse = false;
+      let isDone = false;
+      const toolResults = [];
+
+      for (const block of response.content) {
+        if (signal.aborted) break;
+
+        if (block.type === 'text' && block.text.trim()) {
+          send(ws, { type: 'thought', text: block.text });
+        } else if (block.type === 'tool_use' && block.name === 'browser_action') {
+          hasToolUse = true;
+          const input = block.input;
+
+          if (input.thought) {
+            send(ws, { type: 'thought', text: input.thought });
+          }
+
+          if (input.action === 'done') {
+            isDone = true;
+            send(ws, { type: 'action', text: 'Task complete' });
+            toolResults.push({
+              type: 'tool_result',
+              tool_use_id: block.id,
+              content: 'Task marked as done.',
+            });
+            continue;
+          }
+
+          send(ws, { type: 'action', text: formatSmartAction(input) });
+
+          let resultText = 'Action executed successfully.';
+          try {
+            await executeSmartAction(page, input);
+            await new Promise(r => setTimeout(r, 500));
+            try { await page.waitForLoadState('domcontentloaded', { timeout: 3000 }); } catch {}
+          } catch (err) {
+            resultText = `Action failed: ${err.message}`;
+            send(ws, { type: 'action_error', text: resultText });
+          }
+
+          const screenshot = await takeScreenshot(page);
+          send(ws, { type: 'screenshot', data: screenshot });
+
+          const snapshot = await getAccessibilitySnapshot(page);
+          resultText += `\n\nUpdated page accessibility snapshot:\n\`\`\`\n${snapshot}\n\`\`\``;
+
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: block.id,
+            content: resultText,
+          });
+        }
+      }
+
+      if (isDone || !hasToolUse || response.stop_reason === 'end_turn') {
+        send(ws, { type: 'done', message: 'Task completed.' });
+        break;
+      }
+
+      if (signal.aborted) {
+        send(ws, { type: 'done', message: 'Agent stopped by user.' });
+        break;
+      }
+
+      messages.push({ role: 'user', content: toolResults });
+      send(ws, { type: 'status', text: 'Agent is thinking...' });
+    }
+
+    if (step >= MAX_STEPS) {
+      send(ws, { type: 'done', message: `Reached maximum steps (${MAX_STEPS}).` });
+    }
+
+    // Post-run: analyze captured traffic (reuse existing logic)
+    if (networkCapture && !signal.aborted) {
+      networkCapture.detach();
+      const requests = networkCapture.getRequests();
+      send(ws, { type: 'network_summary', count: requests.length });
+
+      if (requests.length > 0) {
+        send(ws, { type: 'status', text: 'Analyzing captured network traffic...' });
+        try {
+          const apiResult = await analyzeTraffic(requests, task);
+          await mkdir(GENERATED_DIR, { recursive: true });
+          const filename = `api-${Date.now()}.js`;
+          const filepath = path.join(GENERATED_DIR, filename);
+          await writeFile(filepath, apiResult.code);
+
+          send(ws, {
+            type: 'generated_api',
+            code: apiResult.code,
+            parameters: apiResult.parameters,
+            summary: apiResult.summary,
+            filename,
+            requestConfig: apiResult.requestConfig,
+          });
+        } catch (err) {
+          send(ws, { type: 'error', message: `API analysis failed: ${err.message}` });
+        }
+      } else {
+        send(ws, { type: 'status', text: 'No API requests captured during this run.' });
+      }
+    }
+  } catch (err) {
+    if (signal.aborted) {
+      send(ws, { type: 'done', message: 'Agent stopped by user.' });
+    } else {
+      console.error('Smart agent error:', err);
+      send(ws, { type: 'error', message: err.message });
+    }
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
+  }
+}
+
+// ── Browser Actions (Visual Mode) ───────────────────────────────────────────
 
 async function executeAction(page, action) {
   switch (action.action) {
@@ -489,7 +778,14 @@ wss.on('connection', (ws) => {
       if (message.type === 'start') {
         if (abortController) abortController.abort();
         abortController = new AbortController();
-        runAgent(message.task, ws, abortController.signal, message.captureNetwork || false, message.startUrl || null);
+        const sig = abortController.signal;
+        const capture = message.captureNetwork || false;
+        const url = message.startUrl || null;
+        if (message.mode === 'smart') {
+          runSmartAgent(message.task, ws, sig, capture, url);
+        } else {
+          runAgent(message.task, ws, sig, capture, url);
+        }
       } else if (message.type === 'stop') {
         if (abortController) {
           abortController.abort();

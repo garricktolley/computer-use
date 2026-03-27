@@ -149,6 +149,31 @@
 
     .toggle-label { font-size: 12px; color: var(--text-muted); white-space: nowrap; }
 
+    .mode-toggle {
+      display: flex;
+      flex-shrink: 0;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .mode-btn {
+      padding: 6px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .mode-btn:not(:last-child) { border-right: 1px solid var(--border); }
+    .mode-btn:hover { color: var(--text); background: rgba(255,255,255,0.04); }
+    .mode-btn.active { background: var(--accent); color: #fff; }
+    .mode-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
     .btn {
       padding: 10px 20px;
       border-radius: var(--radius);
@@ -422,12 +447,16 @@
   </header>
 
   <div class="input-bar">
+    <div class="mode-toggle">
+      <button class="mode-btn active" data-mode="visual" onclick="setMode('visual')">Visual</button>
+      <button class="mode-btn" data-mode="smart" onclick="setMode('smart')">Smart</button>
+    </div>
     <input
       type="text"
       id="urlInput"
       placeholder="https://example.com (optional)"
       autocomplete="off"
-      style="max-width:240px;flex:none"
+      style="max-width:220px;flex:none"
     />
     <input
       type="text"
@@ -503,6 +532,15 @@
     let ws = null;
     let running = false;
     let currentApiConfig = null;
+    let currentMode = 'visual';
+
+    function setMode(mode) {
+      if (running) return;
+      currentMode = mode;
+      document.querySelectorAll('.mode-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.mode === mode);
+      });
+    }
 
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -587,13 +625,15 @@
       const input = document.getElementById('taskInput');
 
       const urlInput = document.getElementById('urlInput');
+      const modeBtns = document.querySelectorAll('.mode-btn');
       if (state) {
         dot.className = 'status-dot running';
-        text.textContent = 'Running';
+        text.textContent = `Running (${currentMode === 'smart' ? 'Smart' : 'Visual'})`;
         runBtn.disabled = true;
         stopBtn.disabled = false;
         input.disabled = true;
         urlInput.disabled = true;
+        modeBtns.forEach(b => b.disabled = true);
       } else {
         dot.className = 'status-dot';
         text.textContent = 'Idle';
@@ -601,6 +641,7 @@
         stopBtn.disabled = true;
         input.disabled = false;
         urlInput.disabled = false;
+        modeBtns.forEach(b => b.disabled = false);
       }
     }
 
@@ -615,7 +656,7 @@
       document.getElementById('apiPanel').style.display = 'none';
       document.getElementById('apiResponseSection').style.display = 'none';
       currentApiConfig = null;
-      ws.send(JSON.stringify({ type: 'start', task, startUrl, captureNetwork }));
+      ws.send(JSON.stringify({ type: 'start', task, startUrl, captureNetwork, mode: currentMode }));
     }
 
     function stopAgent() {
