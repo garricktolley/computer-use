@@ -1,0 +1,16 @@
+{
+  "name": "browser-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "install-browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "dotenv": "^17.3.1",
+    "express": "^4.19.0",
+    "playwright": "^1.44.0",
+    "ws": "^8.17.0"
+  }
+}
