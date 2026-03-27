@@ -320,16 +320,16 @@ const SMART_TOOL = {
     properties: {
       thought: {
         type: 'string',
-        description: 'Your reasoning about what to do next based on the accessibility snapshot and the task.',
+        description: 'Your reasoning about what to do next based on the page elements and the task.',
       },
       action: {
         type: 'string',
         enum: ['click', 'fill', 'navigate', 'script', 'scroll', 'select', 'press_key', 'wait', 'done'],
         description: 'The action to perform.',
       },
-      selector: {
+      ref: {
         type: 'string',
-        description: 'Playwright selector for the target element. Use role selectors like role=button[name="Submit"], text selectors like text="Click me", or CSS selectors like #id, .class. Required for click, fill, select.',
+        description: 'Element reference from the snapshot (e.g. "@e5"). Required for click, fill, select. Use the @eN refs shown in the page snapshot.',
       },
       value: {
         type: 'string',
@@ -339,7 +339,96 @@ const SMART_TOOL = {
   },
 };
 
-async function getAccessibilitySnapshot(page) {
+// ── Reference-based Snapshot System ──────────────────────────────────────────
+
+// Interactive ARIA roles that get @eN refs
+const INTERACTIVE_ROLES = new Set([
+  'link', 'button', 'textbox', 'checkbox', 'radio', 'combobox', 'listbox',
+  'menuitem', 'menuitemcheckbox', 'menuitemradio', 'option', 'searchbox',
+  'slider', 'spinbutton', 'switch', 'tab', 'treeitem',
+]);
+
+function createSnapshotManager() {
+  let refCounter = 0;
+  let refMap = new Map();       // @eN -> { role, name, selector }
+  let previousCompact = null;   // for diffing
+
+  function parseAndAssignRefs(yamlSnapshot) {
+    refCounter = 0;
+    refMap = new Map();
+    const lines = yamlSnapshot.split('\n');
+    const compactLines = [];
+
+    for (const line of lines) {
+      // Match lines like: "  - button "Submit"" or "  - textbox "Search" [focused]"
+      const match = line.match(/^(\s*-\s+)(\w+)\s+"([^"]*)"(.*)$/);
+      if (match) {
+        const [, indent, role, name, rest] = match;
+        if (INTERACTIVE_ROLES.has(role)) {
+          refCounter++;
+          const ref = `@e${refCounter}`;
+          refMap.set(ref, {
+            role,
+            name,
+            selector: `role=${role}[name="${name.replace(/"/g, '\\"')}"]`,
+          });
+          compactLines.push(`${indent}${role} "${name}" ${ref}${rest}`);
+        } else {
+          compactLines.push(line);
+        }
+      } else {
+        // Match lines like: "  - heading "Title" [level=1]"
+        const headingMatch = line.match(/^(\s*-\s+)(heading)\s+"([^"]*)"(.*)$/);
+        if (headingMatch) {
+          // Don't ref headings, but keep them for context
+          compactLines.push(line);
+        } else {
+          compactLines.push(line);
+        }
+      }
+    }
+
+    return compactLines.join('\n');
+  }
+
+  function getCompactSnapshot(yamlSnapshot) {
+    const compact = parseAndAssignRefs(yamlSnapshot);
+
+    // Generate diff if we have a previous snapshot
+    let diffNote = '';
+    if (previousCompact !== null) {
+      const prevLines = new Set(previousCompact.split('\n').map(l => l.trim()).filter(Boolean));
+      const currLines = compact.split('\n').map(l => l.trim()).filter(Boolean);
+      const added = currLines.filter(l => !prevLines.has(l));
+      const removed = [...prevLines].filter(l => !currLines.includes(l));
+
+      if (added.length + removed.length < currLines.length * 0.5) {
+        // Less than 50% changed — show diff summary
+        diffNote = '\n\n[Changes since last snapshot:';
+        if (added.length > 0) diffNote += ` +${added.length} new elements`;
+        if (removed.length > 0) diffNote += ` -${removed.length} removed`;
+        diffNote += ']';
+      }
+    }
+
+    previousCompact = compact;
+    return compact + diffNote;
+  }
+
+  function resolveRef(ref) {
+    const entry = refMap.get(ref);
+    if (!entry) throw new Error(`Unknown element reference: ${ref}`);
+    return entry;
+  }
+
+  function getRefMap() {
+    return refMap;
+  }
+
+  return { getCompactSnapshot, resolveRef, getRefMap };
+}
+
+async function getRawAriaSnapshot(page) {
   try {
     const snapshot = await page.locator('body').ariaSnapshot({ timeout: 5000 });
     if (snapshot.length > 30000) {
@@ -351,14 +440,19 @@ async function getAccessibilitySnapshot(page) {
   }
 }
 
-function formatSmartAction(input) {
+function formatSmartAction(input, refMap) {
+  const refLabel = input.ref && refMap ? (() => {
+    const entry = refMap.get(input.ref);
+    return entry ? `${input.ref} (${entry.role} "${entry.name}")` : input.ref;
+  })() : input.ref || '';
+
   switch (input.action) {
-    case 'click': return `Click: ${input.selector}`;
-    case 'fill': return `Fill "${input.selector}" with "${input.value}"`;
+    case 'click': return `Click: ${refLabel}`;
+    case 'fill': return `Fill ${refLabel} with "${input.value}"`;
     case 'navigate': return `Navigate to ${input.value}`;
     case 'script': return `Run script: ${input.value?.slice(0, 80)}${(input.value?.length || 0) > 80 ? '...' : ''}`;
     case 'scroll': return `Scroll ${input.value || 'down'}`;
-    case 'select': return `Select "${input.value}" in ${input.selector}`;
+    case 'select': return `Select "${input.value}" in ${refLabel}`;
     case 'press_key': return `Press key: ${input.value}`;
     case 'wait': return 'Waiting...';
     case 'done': return 'Task complete';
@@ -366,13 +460,20 @@ function formatSmartAction(input) {
   }
 }
 
-async function executeSmartAction(page, input) {
+async function executeSmartAction(page, input, snapshotMgr) {
+  // Resolve @eN ref to a Playwright selector
+  const resolveSelector = (ref) => {
+    if (!ref) throw new Error('No element reference provided');
+    const entry = snapshotMgr.resolveRef(ref);
+    return entry.selector;
+  };
+
   switch (input.action) {
     case 'click':
-      await page.locator(input.selector).click({ timeout: 5000 });
+      await page.locator(resolveSelector(input.ref)).click({ timeout: 5000 });
       break;
     case 'fill':
-      await page.locator(input.selector).fill(input.value, { timeout: 5000 });
+      await page.locator(resolveSelector(input.ref)).fill(input.value, { timeout: 5000 });
       break;
     case 'navigate':
       await page.goto(input.value);
@@ -387,7 +488,7 @@ async function executeSmartAction(page, input) {
       break;
     }
     case 'select':
-      await page.locator(input.selector).selectOption(input.value, { timeout: 5000 });
+      await page.locator(resolveSelector(input.ref)).selectOption(input.value, { timeout: 5000 });
       break;
     case 'press_key':
       await page.keyboard.press(input.value);
@@ -426,10 +527,13 @@ async function runSmartAgent(task, ws, signal, captureNetwork, startUrl, credent
     await page.goto(navUrl);
     await page.waitForLoadState('domcontentloaded');
 
+    const snapshotMgr = createSnapshotManager();
+
     const initialScreenshot = await takeScreenshot(page);
     send(ws, { type: 'screenshot', data: initialScreenshot });
 
-    const initialSnapshot = await getAccessibilitySnapshot(page);
+    const rawSnapshot = await getRawAriaSnapshot(page);
+    const initialSnapshot = snapshotMgr.getCompactSnapshot(rawSnapshot);
     send(ws, { type: 'status', text: 'Agent is thinking...' });
 
     const siteContext = startUrl
@@ -440,26 +544,25 @@ async function runSmartAgent(task, ws, signal, captureNetwork, startUrl, credent
       ? `\n\nThe user has provided login credentials:\n- Username: ${credentials.username}\n- Password: ${credentials.password}${credentials.notes ? `\n- Notes: ${credentials.notes}` : ''}\nUse these when you encounter login forms. Fill in the username and password fields and submit.`
       : '';
 
-    const systemPrompt = `You are a browser automation agent. You interact with web pages using structured accessibility data — not screenshots. ${siteContext}
+    const systemPrompt = `You are a browser automation agent. You interact with web pages using structured accessibility data. ${siteContext}
 
-You will receive a YAML-like accessibility snapshot of the current page. Use the browser_action tool to interact with the page.
+You will receive a compact page snapshot where interactive elements have reference IDs like @e1, @e2, etc.
 
-For selectors, use Playwright-compatible selectors derived from the snapshot:
-- Role selectors: role=button[name="Submit"], role=link[name="About"], role=textbox[name="Search"]
-- Text selectors: text="Some visible text"
-- CSS selectors: #id, .class, input[type="email"]
-- Combine: role=textbox[name="Search"] >> nth=0
+To interact with elements, use their @eN reference in the "ref" field of browser_action:
+- To click a button labeled "Submit" shown as: button "Submit" @e3 → use ref: "@e3"
+- To fill a textbox labeled "Search" shown as: textbox "Search" @e1 → use ref: "@e1"
+- To click a link shown as: link "About Us" @e7 → use ref: "@e7"
 
-When you see an element like: heading "Example" [level=1], you can target it with role=heading[name="Example"].
-When you see: textbox "Search", you can target it with role=textbox[name="Search"].
-When you see: link "Click here", you can target it with role=link[name="Click here"].
+For actions that don't target elements (navigate, script, scroll, press_key, wait, done), the ref field is not needed.
+
+The snapshot shows the page structure with roles and accessible names. Non-interactive elements (headings, paragraphs, etc.) provide context but have no refs.
 
 Call browser_action with action "done" when the task is complete.${credentialInstructions}`;
 
     const messages = [
       {
         role: 'user',
-        content: `Task: ${task}\n\nCurrent page accessibility snapshot:\n\`\`\`\n${initialSnapshot}\n\`\`\``,
+        content: `Task: ${task}\n\nCurrent page snapshot:\n\`\`\`\n${initialSnapshot}\n\`\`\``,
       },
     ];
 
@@ -516,12 +619,21 @@ Call browser_action with action "done" when the task is complete.${credentialIns
             continue;
           }
 
-          send(ws, { type: 'action', text: formatSmartAction(input) });
-          recordedSteps.push({ action: input.action, selector: input.selector, value: input.value });
+          send(ws, { type: 'action', text: formatSmartAction(input, snapshotMgr.getRefMap()) });
+
+          // Resolve ref to selector for recording the step
+          let resolvedSelector = input.ref;
+          try {
+            if (input.ref) {
+              const entry = snapshotMgr.resolveRef(input.ref);
+              resolvedSelector = entry.selector;
+            }
+          } catch {}
+          recordedSteps.push({ action: input.action, selector: resolvedSelector, value: input.value });
 
           let resultText = 'Action executed successfully.';
           try {
-            await executeSmartAction(page, input);
+            await executeSmartAction(page, input, snapshotMgr);
             await new Promise(r => setTimeout(r, 500));
             try { await page.waitForLoadState('domcontentloaded', { timeout: 3000 }); } catch {}
           } catch (err) {
@@ -532,8 +644,9 @@ Call browser_action with action "done" when the task is complete.${credentialIns
           const screenshot = await takeScreenshot(page);
           send(ws, { type: 'screenshot', data: screenshot });
 
-          const snapshot = await getAccessibilitySnapshot(page);
-          resultText += `\n\nUpdated page accessibility snapshot:\n\`\`\`\n${snapshot}\n\`\`\``;
+          const rawSnap = await getRawAriaSnapshot(page);
+          const compactSnap = snapshotMgr.getCompactSnapshot(rawSnap);
+          resultText += `\n\nUpdated page snapshot:\n\`\`\`\n${compactSnap}\n\`\`\``;
 
           toolResults.push({
             type: 'tool_result',
