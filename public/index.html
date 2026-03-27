@@ -256,7 +256,7 @@
     .btn-sm { padding: 6px 14px; font-size: 12px; }
 
     /* Main content */
-    .content { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+    .content { flex: 1; display: flex; overflow: hidden; min-height: 200px; }
 
     /* Browser panel */
     .browser-panel {
@@ -386,17 +386,27 @@
     .log-entry.done .msg { color: var(--green); }
     .log-entry.error .msg { color: var(--red); }
 
-    /* API Panel */
-    .api-panel {
-      border-top: 1px solid var(--border);
+    /* Bottom Panels */
+    .bottom-panels {
       display: flex;
-      flex-direction: column;
-      max-height: 55%;
-      overflow: hidden;
+      border-top: 1px solid var(--border);
       flex-shrink: 0;
+      overflow: hidden;
     }
 
-    .api-header {
+    .bottom-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .bottom-panel + .bottom-panel {
+      border-left: 1px solid var(--border);
+    }
+
+    .bottom-panel-header {
       padding: 8px 16px;
       font-size: 11px;
       font-weight: 600;
@@ -412,20 +422,42 @@
       background: rgba(188, 140, 255, 0.05);
     }
 
-    .api-header:hover { background: rgba(188, 140, 255, 0.08); }
-    .api-collapse-icon { font-size: 10px; }
+    .bottom-panel-header:hover { background: rgba(188, 140, 255, 0.08); }
 
-    .api-body {
-      overflow-y: auto;
-      padding: 12px 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
+    .loading-spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--purple);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      flex-shrink: 0;
     }
 
-    .api-body::-webkit-scrollbar { width: 6px; }
-    .api-body::-webkit-scrollbar-track { background: transparent; }
-    .api-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loading-text {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--text-muted);
+      padding: 16px 0;
+    }
+    .api-collapse-icon { font-size: 10px; }
+
+    .bottom-panel-body {
+      overflow-y: auto;
+      padding: 12px 16px;
+      flex-direction: column;
+      gap: 12px;
+      max-height: 40vh;
+    }
+
+    .bottom-panel-body::-webkit-scrollbar { width: 6px; }
+    .bottom-panel-body::-webkit-scrollbar-track { background: transparent; }
+    .bottom-panel-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
     .api-summary { font-size: 13px; color: var(--text); line-height: 1.4; }
 
@@ -489,8 +521,10 @@
     /* Responsive */
     @media (max-width: 800px) {
       .content { flex-direction: column; }
-      .sidebar { width: 100%; height: 240px; border-top: 1px solid var(--border); }
+      .sidebar { width: 100%; height: 200px; border-top: 1px solid var(--border); }
       .browser-panel { border-right: none; }
+      .bottom-panels { flex-direction: column; max-height: none; }
+      .bottom-panel + .bottom-panel { border-left: none; border-top: 1px solid var(--border); }
     }
   </style>
 </head>
@@ -510,6 +544,7 @@
     <div class="mode-toggle">
       <button class="mode-btn active" data-mode="visual" onclick="setMode('visual')">Visual</button>
       <button class="mode-btn" data-mode="smart" onclick="setMode('smart')">Smart</button>
+      <button class="mode-btn" data-mode="shadow" onclick="setMode('shadow')">Shadow</button>
     </div>
     <input
       type="text"
@@ -565,57 +600,59 @@
         </div>
         <div class="log-entries" id="logEntries"></div>
       </div>
+    </div>
+  </div>
 
-      <div class="api-panel" id="apiPanel" style="display:none">
-        <div class="api-header" onclick="toggleApiPanel()">
-          <span>Generated API</span>
-          <span class="api-collapse-icon" id="apiCollapseIcon">&#9660;</span>
-        </div>
-        <div class="api-body" id="apiBody">
-          <div class="api-summary" id="apiSummary"></div>
-
-          <div id="apiAuthSection" style="display:none">
-            <div class="api-section-title">Authentication</div>
-            <div id="apiAuthInfo" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.5"></div>
-          </div>
-
-          <div>
-            <div class="api-section-title">Parameters</div>
-            <div id="apiParams"></div>
-          </div>
-
-          <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn btn-primary btn-sm" onclick="executeApi()" id="apiRunBtn">Run Request</button>
-            <span class="api-file-tag" id="apiFilename"></span>
-          </div>
-
-          <div id="apiResponseSection" style="display:none">
-            <div class="api-section-title">Response</div>
-            <div class="api-response-status" id="apiResponseStatus"></div>
-            <pre class="api-code-block" id="apiResponseBody"></pre>
-          </div>
-
-          <div>
-            <div class="api-section-title">Generated Code</div>
-            <pre class="api-code-block" id="apiCode"></pre>
-          </div>
-        </div>
+  <div class="bottom-panels" id="bottomPanels" style="display:none">
+    <div class="bottom-panel" id="scriptPanel" style="display:none">
+      <div class="bottom-panel-header" onclick="toggleScriptPanel()">
+        <span>Playwright Script</span>
+        <span class="api-collapse-icon" id="scriptCollapseIcon">&#9654;</span>
       </div>
-
-      <div class="api-panel" id="scriptPanel" style="display:none">
-        <div class="api-header" onclick="toggleScriptPanel()">
-          <span>Playwright Script</span>
-          <span class="api-collapse-icon" id="scriptCollapseIcon">&#9660;</span>
+      <div class="bottom-panel-body" id="scriptBody" style="display:none">
+        <div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:8px">
+          Standalone Playwright script that replays this automation without an AI agent.
+          Run with: <code style="color:var(--accent)">node &lt;filename&gt;</code>
         </div>
-        <div class="api-body" id="scriptBody">
-          <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-            Standalone Playwright script that replays this automation without an AI agent.
-            Run with: <code style="color:var(--accent)">node &lt;filename&gt;</code>
-          </div>
-          <div style="display:flex;gap:8px;align-items:center">
-            <span class="api-file-tag" id="scriptFilename"></span>
-          </div>
-          <pre class="api-code-block" id="scriptCode" style="max-height:300px"></pre>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+          <span class="api-file-tag" id="scriptFilename"></span>
+        </div>
+        <pre class="api-code-block" id="scriptCode" style="max-height:400px"></pre>
+      </div>
+    </div>
+
+    <div class="bottom-panel" id="apiPanel" style="display:none">
+      <div class="bottom-panel-header" onclick="toggleApiPanel()">
+        <span>Generated API</span>
+        <span class="api-collapse-icon" id="apiCollapseIcon">&#9654;</span>
+      </div>
+      <div class="bottom-panel-body" id="apiBody" style="display:none">
+        <div class="api-summary" id="apiSummary"></div>
+
+        <div id="apiAuthSection" style="display:none">
+          <div class="api-section-title">Authentication</div>
+          <div id="apiAuthInfo" style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.5"></div>
+        </div>
+
+        <div>
+          <div class="api-section-title">Parameters</div>
+          <div id="apiParams"></div>
+        </div>
+
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary btn-sm" onclick="executeApi()" id="apiRunBtn">Run Request</button>
+          <span class="api-file-tag" id="apiFilename"></span>
+        </div>
+
+        <div id="apiResponseSection" style="display:none">
+          <div class="api-section-title">Response</div>
+          <div class="api-response-status" id="apiResponseStatus"></div>
+          <pre class="api-code-block" id="apiResponseBody"></pre>
+        </div>
+
+        <div>
+          <div class="api-section-title">Generated Code</div>
+          <pre class="api-code-block" id="apiCode" style="max-height:400px"></pre>
         </div>
       </div>
     </div>
@@ -633,6 +670,21 @@
       document.querySelectorAll('.mode-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.mode === mode);
       });
+
+      const taskInput = document.getElementById('taskInput');
+      const captureToggle = document.getElementById('captureToggle');
+      const runBtn = document.getElementById('runBtn');
+
+      if (mode === 'shadow') {
+        taskInput.placeholder = 'Optional description of what you will do...';
+        captureToggle.checked = true;
+        captureToggle.disabled = true;
+        runBtn.textContent = 'Record';
+      } else {
+        taskInput.placeholder = 'Describe what you want the agent to do...';
+        captureToggle.disabled = false;
+        runBtn.textContent = 'Run';
+      }
     }
 
     function toggleCreds() {
@@ -681,6 +733,7 @@
           break;
         case 'network_summary':
           addLog('status', 'Net', `Captured ${msg.count} API request(s)`);
+          if (msg.count > 0) showApiPanelLoading();
           break;
         case 'generated_api':
           currentApiConfig = { requestConfig: msg.requestConfig, parameters: msg.parameters, auth: msg.auth };
@@ -737,11 +790,13 @@
 
       const urlInput = document.getElementById('urlInput');
       const modeBtns = document.querySelectorAll('.mode-btn');
+      const modeLabels = { visual: 'Visual', smart: 'Smart', shadow: 'Recording' };
       if (state) {
         dot.className = 'status-dot running';
-        text.textContent = `Running (${currentMode === 'smart' ? 'Smart' : 'Visual'})`;
+        text.textContent = currentMode === 'shadow' ? 'Recording...' : `Running (${modeLabels[currentMode]})`;
         runBtn.disabled = true;
         stopBtn.disabled = false;
+        stopBtn.textContent = currentMode === 'shadow' ? 'Stop Recording' : 'Stop';
         input.disabled = true;
         urlInput.disabled = true;
         modeBtns.forEach(b => b.disabled = true);
@@ -749,10 +804,15 @@
         dot.className = 'status-dot';
         text.textContent = 'Idle';
         runBtn.disabled = false;
+        runBtn.textContent = currentMode === 'shadow' ? 'Record' : 'Run';
         stopBtn.disabled = true;
+        stopBtn.textContent = 'Stop';
         input.disabled = false;
         urlInput.disabled = false;
         modeBtns.forEach(b => b.disabled = false);
+        if (currentMode !== 'shadow') {
+          document.getElementById('captureToggle').disabled = false;
+        }
       }
     }
 
@@ -761,7 +821,9 @@
       const startUrl = document.getElementById('urlInput').value.trim() || null;
       const captureNetwork = document.getElementById('captureToggle').checked;
       const credentials = getCredentials();
-      if (!task || !ws || ws.readyState !== 1) return;
+      // Shadow mode doesn't require a task description
+      if (currentMode !== 'shadow' && !task) return;
+      if (!ws || ws.readyState !== 1) return;
 
       // Close creds dropdown
       document.getElementById('credsFields').classList.remove('open');
@@ -769,6 +831,7 @@
 
       setRunning(true);
       document.getElementById('stepCounter').textContent = '';
+      document.getElementById('bottomPanels').style.display = 'none';
       document.getElementById('apiPanel').style.display = 'none';
       document.getElementById('apiResponseSection').style.display = 'none';
       document.getElementById('scriptPanel').style.display = 'none';
@@ -786,44 +849,77 @@
 
     // ── API Panel ──
 
+    function showBottomPanels() {
+      document.getElementById('bottomPanels').style.display = 'flex';
+    }
+
+    function showApiPanelLoading() {
+      showBottomPanels();
+      const panel = document.getElementById('apiPanel');
+      panel.style.display = 'flex';
+      const body = document.getElementById('apiBody');
+      body.style.display = 'flex';
+      body.innerHTML = '<div class="loading-text"><span class="loading-spinner"></span>Analyzing network traffic...</div>';
+      document.getElementById('apiCollapseIcon').innerHTML = '&#9660;';
+    }
+
     function showApiPanel(msg) {
+      showBottomPanels();
       const panel = document.getElementById('apiPanel');
       panel.style.display = 'flex';
 
-      document.getElementById('apiSummary').textContent = msg.summary;
-      document.getElementById('apiCode').textContent = msg.code;
-      document.getElementById('apiFilename').textContent = msg.filename;
+      // Rebuild the body (may have been replaced by loading spinner)
+      const body = document.getElementById('apiBody');
+      body.style.display = 'flex';
+      document.getElementById('apiCollapseIcon').innerHTML = '&#9660;';
 
-      // Auth section
-      const authSection = document.getElementById('apiAuthSection');
-      const authInfo = document.getElementById('apiAuthInfo');
+      // Auth HTML
+      let authHtml = '';
       if (msg.auth && msg.auth.type !== 'none') {
-        authSection.style.display = 'block';
         const badge = `<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;text-transform:uppercase;background:rgba(210,153,34,0.15);color:var(--yellow)">${escapeHtml(msg.auth.type)}</span>`;
-        authInfo.innerHTML = `${badge} ${escapeHtml(msg.auth.description || '')}`;
+        let tokenLine = '';
         if (msg.auth.tokenExtraction) {
-          authInfo.innerHTML += `<br><span style="color:var(--text-faint);font-size:11px">Token from: ${escapeHtml(msg.auth.tokenExtraction)}</span>`;
+          tokenLine = `<br><span style="color:var(--text-faint);font-size:11px">Token from: ${escapeHtml(msg.auth.tokenExtraction)}</span>`;
         }
-      } else {
-        authSection.style.display = 'none';
+        authHtml = `
+          <div>
+            <div class="api-section-title">Authentication</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;line-height:1.5">${badge} ${escapeHtml(msg.auth.description || '')}${tokenLine}</div>
+          </div>`;
       }
 
-      // Parameters
-      const paramsDiv = document.getElementById('apiParams');
-      paramsDiv.innerHTML = '';
+      // Parameters HTML
+      let paramsHtml = '';
       (msg.parameters || []).forEach((p, i) => {
         const isPassword = p.name.toLowerCase().includes('password');
-        const div = document.createElement('div');
-        div.className = 'api-param';
-        div.innerHTML = `
-          <label>${escapeHtml(p.name)} <span style="color:var(--text-faint)">(${escapeHtml(p.in)})</span></label>
-          ${p.description ? `<span class="api-param-desc">${escapeHtml(p.description)}</span>` : ''}
-          <input type="${isPassword ? 'password' : 'text'}" data-param-index="${i}" value="${escapeHtml(p.default || '')}" />
-        `;
-        paramsDiv.appendChild(div);
+        paramsHtml += `
+          <div class="api-param">
+            <label>${escapeHtml(p.name)} <span style="color:var(--text-faint)">(${escapeHtml(p.in)})</span></label>
+            ${p.description ? `<span class="api-param-desc">${escapeHtml(p.description)}</span>` : ''}
+            <input type="${isPassword ? 'password' : 'text'}" data-param-index="${i}" value="${escapeHtml(p.default || '')}" />
+          </div>`;
       });
 
-      document.getElementById('apiResponseSection').style.display = 'none';
+      body.innerHTML = `
+        <div class="api-summary">${escapeHtml(msg.summary)}</div>
+        ${authHtml}
+        <div>
+          <div class="api-section-title">Parameters</div>
+          <div id="apiParams">${paramsHtml}</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-primary btn-sm" onclick="executeApi()" id="apiRunBtn">Run Request</button>
+          <span class="api-file-tag">${escapeHtml(msg.filename)}</span>
+        </div>
+        <div id="apiResponseSection" style="display:none">
+          <div class="api-section-title">Response</div>
+          <div class="api-response-status" id="apiResponseStatus"></div>
+          <pre class="api-code-block" id="apiResponseBody"></pre>
+        </div>
+        <div>
+          <div class="api-section-title">Generated Code</div>
+          <pre class="api-code-block" id="apiCode" style="max-height:400px">${escapeHtml(msg.code)}</pre>
+        </div>`;
     }
 
     function toggleApiPanel() {
@@ -839,6 +935,7 @@
     }
 
     function showScriptPanel(msg) {
+      showBottomPanels();
       document.getElementById('scriptPanel').style.display = 'flex';
       document.getElementById('scriptCode').textContent = msg.code;
       document.getElementById('scriptFilename').textContent = msg.filename;

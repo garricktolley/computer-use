@@ -729,6 +729,280 @@ Call browser_action with action "done" when the task is complete.${credentialIns
   }
 }
 
+// ── Shadow Mode (User Recording) ─────────────────────────────────────────────
+
+const RECORDING_SCRIPT = `
+(function() {
+  if (window.__shadowRecorderActive) return;
+  window.__shadowRecorderActive = true;
+
+  function getSelector(el) {
+    // Try aria role + name first
+    const role = el.getAttribute('role') || el.tagName.toLowerCase();
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel) return 'role=' + role + '[name="' + ariaLabel.replace(/"/g, '\\\\"') + '"]';
+
+    // Try id
+    if (el.id) return '#' + CSS.escape(el.id);
+
+    // Try name attr for inputs
+    if (el.name && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA')) {
+      return el.tagName.toLowerCase() + '[name="' + el.name.replace(/"/g, '\\\\"') + '"]';
+    }
+
+    // Try text content for buttons/links
+    if (['A', 'BUTTON'].includes(el.tagName)) {
+      const text = el.textContent.trim().slice(0, 50);
+      if (text) return 'text="' + text.replace(/"/g, '\\\\"') + '"';
+    }
+
+    // Try placeholder for inputs
+    if (el.placeholder) return '[placeholder="' + el.placeholder.replace(/"/g, '\\\\"') + '"]';
+
+    // Fallback to tag + nth-of-type
+    const parent = el.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const idx = siblings.indexOf(el);
+      return el.tagName.toLowerCase() + ':nth-of-type(' + (idx + 1) + ')';
+    }
+    return el.tagName.toLowerCase();
+  }
+
+  document.addEventListener('click', function(e) {
+    const sel = getSelector(e.target);
+    window.__shadowReport({ action: 'click', selector: sel, tag: e.target.tagName, text: (e.target.textContent || '').trim().slice(0, 40) });
+  }, true);
+
+  document.addEventListener('input', function(e) {
+    clearTimeout(e.target.__shadowDebounce);
+    e.target.__shadowDebounce = setTimeout(function() {
+      const sel = getSelector(e.target);
+      window.__shadowReport({ action: 'fill', selector: sel, value: e.target.value });
+    }, 500);
+  }, true);
+
+  document.addEventListener('change', function(e) {
+    if (e.target.tagName === 'SELECT') {
+      const sel = getSelector(e.target);
+      window.__shadowReport({ action: 'select', selector: sel, value: e.target.value });
+    }
+  }, true);
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      const sel = getSelector(e.target);
+      window.__shadowReport({ action: 'press_key', selector: sel, value: 'Enter' });
+    }
+  }, true);
+
+  document.addEventListener('scroll', function() {
+    clearTimeout(window.__shadowScrollDebounce);
+    window.__shadowScrollDebounce = setTimeout(function() {
+      window.__shadowReport({ action: 'scroll', value: 'down' });
+    }, 300);
+  }, true);
+})();
+`;
+
+async function runShadowMode(task, ws, signal, startUrl, credentials) {
+  let browser = null;
+
+  try {
+    send(ws, { type: 'status', text: 'Launching browser for Shadow Mode...' });
+    send(ws, { type: 'thought', text: 'A browser window will open. Perform your task there — all actions are being recorded. Click Stop when done.' });
+
+    browser = await chromium.launch({ headless: false });
+    const context = await browser.newContext({
+      viewport: { width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT },
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    });
+
+    const recordedSteps = [];
+    const allPages = new Set();
+    let activePage = null;
+
+    // Set up network capture on the context level (catches all pages)
+    // We'll attach per-page below
+    const capturedNetworkRequests = [];
+
+    function setupPageNetworkCapture(pg) {
+      pg.on('response', async (response) => {
+        const request = response.request();
+        const resourceType = request.resourceType();
+        const url = request.url();
+        const method = request.method();
+        if (SKIP_RESOURCE_TYPES.has(resourceType)) return;
+        if (SKIP_EXTENSIONS.test(url)) return;
+        const isApiLike = resourceType === 'xhr' || resourceType === 'fetch'
+          || ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+        if (!isApiLike) return;
+        let responseBody = null;
+        try { responseBody = await response.text(); } catch {}
+        capturedNetworkRequests.push({
+          url, method, resourceType,
+          requestHeaders: request.headers(),
+          requestPostData: request.postData() || null,
+          responseStatus: response.status(),
+          responseHeaders: response.headers(),
+          responseBody, timestamp: Date.now(),
+        });
+      });
+    }
+
+    // Instrument a page with recording script and event listeners
+    async function instrumentPage(pg) {
+      if (allPages.has(pg)) return;
+      allPages.add(pg);
+      activePage = pg;
+
+      setupPageNetworkCapture(pg);
+
+      // Expose the reporting function (must be done before any navigation)
+      try {
+        await pg.exposeFunction('__shadowReport', (action) => {
+          recordedSteps.push(action);
+          send(ws, { type: 'action', text: formatShadowAction(action) });
+        });
+      } catch {} // may already be exposed if page reuses context
+
+      // Inject recorder on every load/navigation
+      pg.on('load', async () => {
+        try { await pg.evaluate(RECORDING_SCRIPT); } catch {}
+        // Take a screenshot on navigation for the UI
+        try {
+          const screenshot = await takeScreenshot(pg);
+          send(ws, { type: 'screenshot', data: screenshot });
+        } catch {}
+      });
+
+      // Record navigations
+      pg.on('framenavigated', (frame) => {
+        if (frame === pg.mainFrame()) {
+          const url = frame.url();
+          if (url && url !== 'about:blank') {
+            recordedSteps.push({ action: 'navigate', value: url });
+            send(ws, { type: 'action', text: `Navigate to ${url}` });
+          }
+        }
+      });
+
+      // When this page gets focus, update activePage for screenshots
+      pg.on('focus', () => { activePage = pg; });
+
+      // Log when page closes
+      pg.on('close', () => {
+        allPages.delete(pg);
+        if (activePage === pg) {
+          activePage = allPages.size > 0 ? [...allPages][allPages.size - 1] : null;
+        }
+      });
+    }
+
+    // Catch new tabs/popups
+    context.on('page', async (newPage) => {
+      send(ws, { type: 'action', text: 'New tab opened' });
+      await instrumentPage(newPage);
+      try {
+        await newPage.waitForLoadState('domcontentloaded', { timeout: 5000 });
+        await newPage.evaluate(RECORDING_SCRIPT);
+        const screenshot = await takeScreenshot(newPage);
+        send(ws, { type: 'screenshot', data: screenshot });
+      } catch {}
+    });
+
+    // Set up the initial page
+    const page = await context.newPage();
+    await instrumentPage(page);
+
+    // Navigate to start URL
+    const navUrl = startUrl || 'https://www.google.com';
+    send(ws, { type: 'status', text: `Opening ${navUrl}...` });
+    await page.goto(navUrl);
+    await page.waitForLoadState('domcontentloaded');
+    await page.evaluate(RECORDING_SCRIPT);
+
+    const initialScreenshot = await takeScreenshot(page);
+    send(ws, { type: 'screenshot', data: initialScreenshot });
+    send(ws, { type: 'status', text: 'Recording your actions... Click Stop when done.' });
+
+    // Wait for user to click Stop (or browser to close)
+    await new Promise((resolve) => {
+      const check = setInterval(() => {
+        if (signal.aborted || allPages.size === 0) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 200);
+      context.on('close', () => { clearInterval(check); resolve(); });
+    });
+
+    // Filter out the initial navigation since it's the start URL
+    const steps = recordedSteps.filter((s, i) => !(i === 0 && s.action === 'navigate' && s.value === navUrl));
+
+    send(ws, { type: 'done', message: `Recording complete. Captured ${steps.length} actions.` });
+
+    // Generate Playwright script
+    if (steps.length > 0) {
+      const script = generatePlaywrightScript(steps, startUrl, 'smart');
+      const scriptFilename = `script-${Date.now()}.js`;
+      await mkdir(GENERATED_DIR, { recursive: true });
+      await writeFile(path.join(GENERATED_DIR, scriptFilename), script);
+      send(ws, { type: 'generated_script', code: script, filename: scriptFilename });
+    }
+
+    // Analyze network traffic (captured across all pages)
+    const requests = capturedNetworkRequests;
+    send(ws, { type: 'network_summary', count: requests.length });
+
+    if (requests.length > 0) {
+      send(ws, { type: 'status', text: 'Analyzing captured network traffic...' });
+      try {
+        let cookies = [];
+        try { cookies = await context.cookies(); } catch {}
+        const apiResult = await analyzeTraffic(requests, task || 'User-recorded browser session', cookies, credentials);
+        await mkdir(GENERATED_DIR, { recursive: true });
+        const filename = `api-${Date.now()}.js`;
+        const filepath = path.join(GENERATED_DIR, filename);
+        await writeFile(filepath, apiResult.code);
+
+        send(ws, {
+          type: 'generated_api',
+          code: apiResult.code,
+          parameters: apiResult.parameters,
+          summary: apiResult.summary,
+          filename,
+          requestConfig: apiResult.requestConfig,
+          auth: apiResult.auth || null,
+        });
+      } catch (err) {
+        send(ws, { type: 'error', message: `API analysis failed: ${err.message}` });
+      }
+    }
+  } catch (err) {
+    if (!signal.aborted) {
+      console.error('Shadow mode error:', err);
+      send(ws, { type: 'error', message: err.message });
+    }
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch {}
+    }
+  }
+}
+
+function formatShadowAction(action) {
+  switch (action.action) {
+    case 'click': return `Click: ${action.selector}${action.text ? ` ("${action.text}")` : ''}`;
+    case 'fill': return `Type in ${action.selector}: "${(action.value || '').slice(0, 40)}"`;
+    case 'select': return `Select "${action.value}" in ${action.selector}`;
+    case 'press_key': return `Press ${action.value}`;
+    case 'scroll': return `Scroll ${action.value || 'down'}`;
+    case 'navigate': return `Navigate to ${action.value}`;
+    default: return action.action;
+  }
+}
+
 // ── Browser Actions (Visual Mode) ───────────────────────────────────────────
 
 async function executeAction(page, action) {
@@ -1059,7 +1333,9 @@ wss.on('connection', (ws) => {
         const capture = message.captureNetwork || false;
         const url = message.startUrl || null;
         const creds = message.credentials || null;
-        if (message.mode === 'smart') {
+        if (message.mode === 'shadow') {
+          runShadowMode(message.task, ws, sig, url, creds);
+        } else if (message.mode === 'smart') {
           runSmartAgent(message.task, ws, sig, capture, url, creds);
         } else {
           runAgent(message.task, ws, sig, capture, url, creds);
