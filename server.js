@@ -124,7 +124,7 @@ function setupNetworkCapture(page) {
 
 // ── Traffic Analysis ─────────────────────────────────────────────────────────
 
-async function analyzeTraffic(requests, originalTask) {
+async function analyzeTraffic(requests, originalTask, cookies, credentials) {
   const trimmed = requests.slice(-30).map(r => ({
     ...r,
     responseBody: r.responseBody && r.responseBody.length > 2000
@@ -135,32 +135,53 @@ async function analyzeTraffic(requests, originalTask) {
       : r.requestPostData,
   }));
 
+  const cookieSummary = cookies && cookies.length > 0
+    ? `\n\nSession cookies after task completion:\n${JSON.stringify(cookies.map(c => ({ name: c.name, domain: c.domain, path: c.path, httpOnly: c.httpOnly, secure: c.secure })), null, 2)}`
+    : '';
+
+  const credentialNote = credentials
+    ? `\n\nThe user provided login credentials (username: "${credentials.username}"). Look for login/auth requests in the traffic that used these credentials.`
+    : '';
+
   const response = await client.messages.create({
     model: 'claude-sonnet-4-6',
-    max_tokens: 4096,
+    max_tokens: 8192,
     messages: [{
       role: 'user',
       content: `You are analyzing network traffic captured during a browser automation task.
 
-The user's original task was: "${originalTask}"
+The user's original task was: "${originalTask}"${credentialNote}${cookieSummary}
 
 Here are the captured HTTP requests (XHR/fetch only):
 
 ${JSON.stringify(trimmed, null, 2)}
 
 Your job:
-1. Identify the key API request(s) that represent the core action (form submission, data fetch, file download, etc.)
-2. Generate a standalone Node.js Express route that wraps/proxies this request
-3. Extract editable parameters from the URL, request body, query string, and headers
+1. Identify any login/authentication requests (POST to /login, /oauth/token, /auth, /session, etc.) and the main API request(s)
+2. Determine the auth pattern: bearer token, cookie-based session, API key, basic auth, or none
+3. Generate a standalone Node.js Express server that handles auth + the main request
+4. Extract editable parameters
 
 Respond with EXACTLY this JSON structure (no markdown fences, no extra text):
 {
   "summary": "One sentence describing what the API does",
+  "auth": {
+    "type": "bearer|cookie|basic|api_key|none",
+    "description": "How auth works for this API",
+    "loginRequest": {
+      "url": "login endpoint URL or null if no login needed",
+      "method": "POST",
+      "headers": {},
+      "body": "login request body with {{username}} and {{password}} placeholders, or null"
+    },
+    "tokenExtraction": "Where the token comes from, e.g. response.body.access_token, Set-Cookie header, etc. Null if none.",
+    "tokenPlacement": "How to use the token, e.g. Authorization: Bearer {{token}}, Cookie: session={{token}}, etc. Null if none."
+  },
   "requestConfig": {
-    "url": "the target URL with {{parameter}} placeholders where appropriate",
+    "url": "the target URL with {{parameter}} placeholders",
     "method": "POST",
     "headers": { "Content-Type": "...", "other": "headers..." },
-    "body": "the request body template with {{parameter}} placeholders, or null"
+    "body": "request body template with {{parameter}} placeholders, or null"
   },
   "parameters": [
     { "name": "paramName", "in": "body|url|header|query", "default": "captured value", "description": "what this parameter is" }
@@ -168,16 +189,22 @@ Respond with EXACTLY this JSON structure (no markdown fences, no extra text):
   "code": "full standalone Express server code"
 }
 
+For the "auth" field:
+- If you find a login request, include it with {{username}} and {{password}} placeholders
+- If auth is cookie-based, set type to "cookie"
+- If no auth is detected, set type to "none" and loginRequest to null
+- tokenExtraction should describe the exact path (e.g. "response.body.token" or "Set-Cookie: session_id=...")
+
 The "code" field should be a complete, runnable Node.js file that:
 - Uses import syntax (ESM)
 - Creates an Express app on port 3001
-- Has a single POST /api/run endpoint
-- Accepts the parameters as JSON body fields
-- Uses native fetch() to make the upstream request
-- Returns the upstream response
-- Has helpful comments explaining what it does
+- If auth is detected: has POST /api/login that replays the login and returns the token
+- Has POST /api/run that accepts parameters + optional token (or does auto-login if credentials provided)
+- Uses native fetch() for all upstream requests
+- Handles cookies properly if cookie-based auth (forwards Set-Cookie, stores cookies between requests)
+- Has helpful comments
 
-Skip auth tokens / cookies from parameters unless they are clearly user-provided values.`
+For parameters: include username and password as parameters if auth is detected. Use {{username}} and {{password}} placeholders in the login request body.`
     }],
   });
 
@@ -277,7 +304,7 @@ async function executeSmartAction(page, input) {
   }
 }
 
-async function runSmartAgent(task, ws, signal, captureNetwork, startUrl) {
+async function runSmartAgent(task, ws, signal, captureNetwork, startUrl, credentials) {
   let browser = null;
 
   try {
@@ -311,6 +338,10 @@ async function runSmartAgent(task, ws, signal, captureNetwork, startUrl) {
       ? `The browser is open to ${navUrl}.`
       : 'The browser is open to Google.';
 
+    const credentialInstructions = credentials
+      ? `\n\nThe user has provided login credentials:\n- Username: ${credentials.username}\n- Password: ${credentials.password}${credentials.notes ? `\n- Notes: ${credentials.notes}` : ''}\nUse these when you encounter login forms. Fill in the username and password fields and submit.`
+      : '';
+
     const systemPrompt = `You are a browser automation agent. You interact with web pages using structured accessibility data — not screenshots. ${siteContext}
 
 You will receive a YAML-like accessibility snapshot of the current page. Use the browser_action tool to interact with the page.
@@ -325,7 +356,7 @@ When you see an element like: heading "Example" [level=1], you can target it wit
 When you see: textbox "Search", you can target it with role=textbox[name="Search"].
 When you see: link "Click here", you can target it with role=link[name="Click here"].
 
-Call browser_action with action "done" when the task is complete.`;
+Call browser_action with action "done" when the task is complete.${credentialInstructions}`;
 
     const messages = [
       {
@@ -440,7 +471,8 @@ Call browser_action with action "done" when the task is complete.`;
       if (requests.length > 0) {
         send(ws, { type: 'status', text: 'Analyzing captured network traffic...' });
         try {
-          const apiResult = await analyzeTraffic(requests, task);
+          const cookies = await context.cookies();
+          const apiResult = await analyzeTraffic(requests, task, cookies, credentials);
           await mkdir(GENERATED_DIR, { recursive: true });
           const filename = `api-${Date.now()}.js`;
           const filepath = path.join(GENERATED_DIR, filename);
@@ -453,6 +485,7 @@ Call browser_action with action "done" when the task is complete.`;
             summary: apiResult.summary,
             filename,
             requestConfig: apiResult.requestConfig,
+            auth: apiResult.auth || null,
           });
         } catch (err) {
           send(ws, { type: 'error', message: `API analysis failed: ${err.message}` });
@@ -547,7 +580,7 @@ async function executeAction(page, action) {
 
 // ── Agent Loop ───────────────────────────────────────────────────────────────
 
-async function runAgent(task, ws, signal, captureNetwork, startUrl) {
+async function runAgent(task, ws, signal, captureNetwork, startUrl, credentials) {
   let browser = null;
 
   try {
@@ -590,7 +623,7 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl) {
           },
           {
             type: 'text',
-            text: `You are controlling a browser via screenshots and mouse/keyboard actions. ${siteContext} Complete this task:\n\n${task}`,
+            text: `You are controlling a browser via screenshots and mouse/keyboard actions. ${siteContext}${credentials ? `\n\nLogin credentials provided — Username: ${credentials.username}, Password: ${credentials.password}${credentials.notes ? `, Notes: ${credentials.notes}` : ''}. Use these when you encounter login forms.` : ''}\n\nComplete this task:\n\n${task}`,
           },
         ],
       },
@@ -698,7 +731,8 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl) {
       if (requests.length > 0) {
         send(ws, { type: 'status', text: 'Analyzing captured network traffic...' });
         try {
-          const apiResult = await analyzeTraffic(requests, task);
+          const cookies = await context.cookies();
+          const apiResult = await analyzeTraffic(requests, task, cookies, credentials);
           await mkdir(GENERATED_DIR, { recursive: true });
           const filename = `api-${Date.now()}.js`;
           const filepath = path.join(GENERATED_DIR, filename);
@@ -711,6 +745,7 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl) {
             summary: apiResult.summary,
             filename,
             requestConfig: apiResult.requestConfig,
+            auth: apiResult.auth || null,
           });
         } catch (err) {
           send(ws, { type: 'error', message: `API analysis failed: ${err.message}` });
@@ -737,13 +772,20 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl) {
 
 app.post('/api/execute', async (req, res) => {
   try {
-    const { url, method, headers, body } = req.body;
+    const { url, method, headers, body, cookies } = req.body;
 
     if (!url || !method) {
       return res.status(400).json({ error: 'url and method are required' });
     }
 
-    const fetchOptions = { method, headers: headers || {} };
+    const fetchHeaders = { ...(headers || {}) };
+
+    // Merge cookies into Cookie header if provided
+    if (cookies && typeof cookies === 'string') {
+      fetchHeaders['Cookie'] = cookies;
+    }
+
+    const fetchOptions = { method, headers: fetchHeaders, redirect: 'follow' };
     if (body && method !== 'GET') {
       fetchOptions.body = typeof body === 'string' ? body : JSON.stringify(body);
     }
@@ -781,10 +823,11 @@ wss.on('connection', (ws) => {
         const sig = abortController.signal;
         const capture = message.captureNetwork || false;
         const url = message.startUrl || null;
+        const creds = message.credentials || null;
         if (message.mode === 'smart') {
-          runSmartAgent(message.task, ws, sig, capture, url);
+          runSmartAgent(message.task, ws, sig, capture, url, creds);
         } else {
-          runAgent(message.task, ws, sig, capture, url);
+          runAgent(message.task, ws, sig, capture, url, creds);
         }
       } else if (message.type === 'stop') {
         if (abortController) {
