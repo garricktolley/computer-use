@@ -601,6 +601,23 @@
           </div>
         </div>
       </div>
+
+      <div class="api-panel" id="scriptPanel" style="display:none">
+        <div class="api-header" onclick="toggleScriptPanel()">
+          <span>Playwright Script</span>
+          <span class="api-collapse-icon" id="scriptCollapseIcon">&#9660;</span>
+        </div>
+        <div class="api-body" id="scriptBody">
+          <div style="font-size:12px;color:var(--text-muted);line-height:1.5">
+            Standalone Playwright script that replays this automation without an AI agent.
+            Run with: <code style="color:var(--accent)">node &lt;filename&gt;</code>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span class="api-file-tag" id="scriptFilename"></span>
+          </div>
+          <pre class="api-code-block" id="scriptCode" style="max-height:300px"></pre>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -668,6 +685,9 @@
         case 'generated_api':
           currentApiConfig = { requestConfig: msg.requestConfig, parameters: msg.parameters, auth: msg.auth };
           showApiPanel(msg);
+          break;
+        case 'generated_script':
+          showScriptPanel(msg);
           break;
         case 'done':
           addLog('done', 'Done', msg.message);
@@ -751,6 +771,7 @@
       document.getElementById('stepCounter').textContent = '';
       document.getElementById('apiPanel').style.display = 'none';
       document.getElementById('apiResponseSection').style.display = 'none';
+      document.getElementById('scriptPanel').style.display = 'none';
       currentApiConfig = null;
       const msg = { type: 'start', task, startUrl, captureNetwork, mode: currentMode };
       if (credentials) msg.credentials = credentials;
@@ -808,6 +829,24 @@
     function toggleApiPanel() {
       const body = document.getElementById('apiBody');
       const icon = document.getElementById('apiCollapseIcon');
+      if (body.style.display === 'none') {
+        body.style.display = 'flex';
+        icon.innerHTML = '&#9660;';
+      } else {
+        body.style.display = 'none';
+        icon.innerHTML = '&#9654;';
+      }
+    }
+
+    function showScriptPanel(msg) {
+      document.getElementById('scriptPanel').style.display = 'flex';
+      document.getElementById('scriptCode').textContent = msg.code;
+      document.getElementById('scriptFilename').textContent = msg.filename;
+    }
+
+    function toggleScriptPanel() {
+      const body = document.getElementById('scriptBody');
+      const icon = document.getElementById('scriptCollapseIcon');
       if (body.style.display === 'none') {
         body.style.display = 'flex';
         icon.innerHTML = '&#9660;';

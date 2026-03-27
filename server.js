@@ -77,6 +77,102 @@ async function takeScreenshot(page) {
   return buffer.toString('base64');
 }
 
+// ── Playwright Script Recorder ───────────────────────────────────────────────
+
+function generatePlaywrightScript(steps, startUrl, mode) {
+  const indent = '  ';
+  const lines = [];
+
+  for (const step of steps) {
+    if (mode === 'smart') {
+      switch (step.action) {
+        case 'click':
+          lines.push(`${indent}await page.locator(${JSON.stringify(step.selector)}).click();`);
+          break;
+        case 'fill':
+          lines.push(`${indent}await page.locator(${JSON.stringify(step.selector)}).fill(${JSON.stringify(step.value)});`);
+          break;
+        case 'navigate':
+          lines.push(`${indent}await page.goto(${JSON.stringify(step.value)});`);
+          break;
+        case 'script':
+          lines.push(`${indent}await page.evaluate(${JSON.stringify(step.value)});`);
+          break;
+        case 'scroll':
+          lines.push(`${indent}await page.mouse.wheel(0, ${(step.value || 'down') === 'up' ? -500 : 500});`);
+          break;
+        case 'select':
+          lines.push(`${indent}await page.locator(${JSON.stringify(step.selector)}).selectOption(${JSON.stringify(step.value)});`);
+          break;
+        case 'press_key':
+          lines.push(`${indent}await page.keyboard.press(${JSON.stringify(step.value)});`);
+          break;
+        case 'wait':
+          lines.push(`${indent}await page.waitForTimeout(1500);`);
+          break;
+      }
+    } else {
+      // Visual mode — coordinate-based actions
+      switch (step.action) {
+        case 'left_click':
+          lines.push(`${indent}await page.mouse.click(${step.coordinate[0]}, ${step.coordinate[1]});`);
+          break;
+        case 'right_click':
+          lines.push(`${indent}await page.mouse.click(${step.coordinate[0]}, ${step.coordinate[1]}, { button: 'right' });`);
+          break;
+        case 'double_click':
+          lines.push(`${indent}await page.mouse.dblclick(${step.coordinate[0]}, ${step.coordinate[1]});`);
+          break;
+        case 'type':
+          lines.push(`${indent}await page.keyboard.type(${JSON.stringify(step.text)});`);
+          break;
+        case 'key':
+          lines.push(`${indent}await page.keyboard.press(${JSON.stringify(step.key)});`);
+          break;
+        case 'scroll':
+          lines.push(`${indent}await page.mouse.wheel(0, ${step.scroll_direction === 'up' ? -(step.scroll_amount || 3) * 120 : (step.scroll_amount || 3) * 120});`);
+          break;
+        case 'mouse_move':
+          lines.push(`${indent}await page.mouse.move(${step.coordinate[0]}, ${step.coordinate[1]});`);
+          break;
+        case 'wait':
+          lines.push(`${indent}await page.waitForTimeout(${step.duration || 1000});`);
+          break;
+      }
+    }
+    // Small delay between actions for stability
+    lines.push(`${indent}await page.waitForTimeout(500);`);
+  }
+
+  return `import { chromium } from 'playwright';
+
+// Auto-generated Playwright script
+// Replays the browser automation steps without needing an AI agent
+
+const VIEWPORT = { width: ${DISPLAY_WIDTH}, height: ${DISPLAY_HEIGHT} };
+
+async function run() {
+  const browser = await chromium.launch({ headless: false });
+  const context = await browser.newContext({ viewport: VIEWPORT });
+  const page = await context.newPage();
+
+  await page.goto(${JSON.stringify(startUrl || 'https://www.google.com')});
+  await page.waitForLoadState('domcontentloaded');
+
+${lines.join('\n')}
+
+  console.log('Script complete. Browser will stay open for 10 seconds...');
+  await page.waitForTimeout(10000);
+  await browser.close();
+}
+
+run().catch(err => {
+  console.error('Script failed:', err);
+  process.exit(1);
+});
+`;
+}
+
 // ── Network Capture ──────────────────────────────────────────────────────────
 
 const SKIP_RESOURCE_TYPES = new Set(['image', 'stylesheet', 'font', 'media', 'manifest', 'other']);
@@ -317,6 +413,8 @@ async function runSmartAgent(task, ws, signal, captureNetwork, startUrl, credent
     });
     const page = await context.newPage();
 
+    const recordedSteps = [];
+
     let networkCapture = null;
     if (captureNetwork) {
       networkCapture = setupNetworkCapture(page);
@@ -419,6 +517,7 @@ Call browser_action with action "done" when the task is complete.${credentialIns
           }
 
           send(ws, { type: 'action', text: formatSmartAction(input) });
+          recordedSteps.push({ action: input.action, selector: input.selector, value: input.value });
 
           let resultText = 'Action executed successfully.';
           try {
@@ -460,6 +559,15 @@ Call browser_action with action "done" when the task is complete.${credentialIns
 
     if (step >= MAX_STEPS) {
       send(ws, { type: 'done', message: `Reached maximum steps (${MAX_STEPS}).` });
+    }
+
+    // Post-run: generate Playwright script
+    if (recordedSteps.length > 0 && !signal.aborted) {
+      const script = generatePlaywrightScript(recordedSteps, startUrl, 'smart');
+      const scriptFilename = `script-${Date.now()}.js`;
+      await mkdir(GENERATED_DIR, { recursive: true });
+      await writeFile(path.join(GENERATED_DIR, scriptFilename), script);
+      send(ws, { type: 'generated_script', code: script, filename: scriptFilename });
     }
 
     // Post-run: analyze captured traffic (reuse existing logic)
@@ -593,6 +701,8 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl, credentials)
     });
     const page = await context.newPage();
 
+    const recordedSteps = [];
+
     // Set up network capture if enabled
     let networkCapture = null;
     if (captureNetwork) {
@@ -677,6 +787,9 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl, credentials)
           const action = block.input;
 
           send(ws, { type: 'action', text: formatAction(action) });
+          if (action.action !== 'screenshot') {
+            recordedSteps.push(action);
+          }
 
           try {
             if (action.action !== 'screenshot') {
@@ -720,6 +833,15 @@ async function runAgent(task, ws, signal, captureNetwork, startUrl, credentials)
 
     if (step >= MAX_STEPS) {
       send(ws, { type: 'done', message: `Reached maximum steps (${MAX_STEPS}).` });
+    }
+
+    // Post-run: generate Playwright script
+    if (recordedSteps.length > 0 && !signal.aborted) {
+      const script = generatePlaywrightScript(recordedSteps, startUrl, 'visual');
+      const scriptFilename = `script-${Date.now()}.js`;
+      await mkdir(GENERATED_DIR, { recursive: true });
+      await writeFile(path.join(GENERATED_DIR, scriptFilename), script);
+      send(ws, { type: 'generated_script', code: script, filename: scriptFilename });
     }
 
     // ── Post-run: analyze captured traffic ──
